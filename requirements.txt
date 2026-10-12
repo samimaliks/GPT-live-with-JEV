@@ -1,0 +1,11 @@
+openai[realtime]>=3.12
+sounddevice
+numpy
+python-dotenv
+typesafe-sdk>=0.5.7
+streamlit>=1.33
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
+fastapi
+uvicorn
