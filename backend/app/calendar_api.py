@@ -105,3 +105,48 @@ def create_event(
         raise RuntimeError("Google created the event but did not return a link.")
     clock = start.strftime("%I:%M %p").lstrip("0")
     return link, f"{start.strftime('%A %d %B')} at {clock}"
+
+
+def move_event(
+    owner_email: str,
+    event_id: str,
+    start: datetime,
+    end: datetime,
+) -> tuple[str, str]:
+    """Move an existing timed event. Keeps the title and guests."""
+    zone = ZoneInfo(TIMEZONE)
+    event_id = (event_id or "").strip()
+    if not event_id:
+        raise ValueError("Which event should be moved?")
+    if start.tzinfo is None or end.tzinfo is None:
+        raise ValueError("The event time needs a timezone.")
+    start = start.astimezone(zone)
+    end = end.astimezone(zone)
+    minutes = int((end - start).total_seconds() // 60)
+    if minutes < 5 or minutes > 480:
+        raise ValueError("The event length must be between 5 minutes and 8 hours.")
+    if start <= datetime.now(zone):
+        raise ValueError("The new event time has already passed.")
+    service = build("calendar", "v3", credentials=credentials_for(owner_email))
+    existing = service.events().get(calendarId="primary", eventId=event_id).execute()
+    if (existing.get("start") or {}).get("date") and not (existing.get("start") or {}).get("dateTime"):
+        raise ValueError("All-day events cannot be moved this way. Pick a timed event.")
+    people = [person.get("email", "") for person in existing.get("attendees") or [] if person.get("email")]
+    event = (
+        service.events()
+        .patch(
+            calendarId="primary",
+            eventId=event_id,
+            sendUpdates="all" if people else "none",
+            body={
+                "start": {"dateTime": start.isoformat(), "timeZone": TIMEZONE},
+                "end": {"dateTime": end.isoformat(), "timeZone": TIMEZONE},
+            },
+        )
+        .execute()
+    )
+    link = event.get("htmlLink")
+    if not isinstance(link, str) or not link:
+        raise RuntimeError("Google moved the event but did not return a link.")
+    clock = start.strftime("%I:%M %p").lstrip("0")
+    return link, f"{start.strftime('%A %d %B')} at {clock}"

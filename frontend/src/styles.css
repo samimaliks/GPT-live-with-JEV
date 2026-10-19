@@ -255,15 +255,42 @@ pre {
 
 .event, .block {
   position: absolute;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   overflow: hidden;
   border-radius: 6px;
   padding: 4px 6px;
   color: #fff;
   font-size: 12px;
+  line-height: 1.2;
+  box-sizing: border-box;
 }
 .block { position: static; margin: 4px; }
-.event strong, .block strong, .event em, .block em { display: block; font-style: normal; }
-.event em, .block em { opacity: 0.9; font-size: 11px; }
+.event strong, .block strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+.event .jev-tag, .block .jev-tag {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 4px;
+  max-width: 100%;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.22);
+  font-size: 10px;
+  font-weight: 700;
+  font-style: normal;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.event .jev-tag b, .block .jev-tag b { font-weight: 800; }
 .event.now, .block.now { background: #188038; }
 .event.later, .block.later { background: #1a73e8; }
 .outside { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px; border-top: 1px solid #e0e0e0; }

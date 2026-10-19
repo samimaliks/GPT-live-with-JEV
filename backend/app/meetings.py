@@ -14,15 +14,33 @@ EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
 def wants_existing_invites(text: str) -> bool:
     """True when the user asks to read existing calendar events (not create a new one)."""
     low = text.lower()
+    # Creating a new event is handled elsewhere.
+    if re.search(r"\b(create|add|book)\b.{0,40}\b(event|meeting|appointment|invite)\b", low):
+        return False
     if re.search(
         r"\b(what(?:'s| is| are)?)\b.{0,40}\b(on my (?:calendar|schedule)|my (?:events?|meetings?|appointments?|invites?))\b"
-        r"|\b(show|list|read|tell|get|fetch|pull|give)\b.{0,30}\b(me\s+)?(my\s+)?(all\s+)?(calendar|events?|meetings?|appointments?|invites?|schedule)\b"
-        r"|\b(do i have|any)\b.{0,20}\b(events?|meetings?|appointments?|invites?)\b"
+        r"|\b(what|which)\b.{0,40}\b(events?|meetings?|appointments?|invites?)\b"
+        r"|\b(show|list|read|tell|get|fetch|pull|give)\b.{0,40}\b(me\s+)?(my\s+)?(all\s+)?(calendar|events?|meetings?|appointments?|invites?|schedule)\b"
+        r"|\b(do i have|any|have i|got any)\b.{0,30}\b(events?|meetings?|appointments?|invites?)\b"
         r"|\b(upcoming|existing|already)\b.{0,20}\b(events?|meetings?|appointments?|invites?|calendar)\b"
         r"|\b(check|look at|open)\b.{0,20}\b(my\s+)?(calendar|schedule)\b"
+        r"|\b(see|find|view)\b.{0,40}\b(my\s+)?(events?|meetings?|appointments?|invites?|calendar|schedule)\b"
+        r"|\b(unable|can't|cannot|don't|dont)\b.{0,40}\b(see|find|view)\b.{0,40}\b(events?|meetings?|appointments?|calendar)\b"
         r"|\bmy (?:events?|meetings?|appointments?)\b.{0,20}\b(today|tomorrow|this week)?\b",
         low,
     ):
+        return True
+    # Noisy speech often still contains both an ask word and a calendar word.
+    has_cal = re.search(
+        r"\b(calendar|schedule|meetings?|events?|appointments?|invites?)\b",
+        low,
+    )
+    has_ask = re.search(
+        r"\b(what|what's|whats|which|when|show|list|see|check|get|tell|read|any|"
+        r"unable|can't|cannot|where|do i have|have i)\b",
+        low,
+    )
+    if has_cal and has_ask:
         return True
     if "invite" not in low and "calendar" not in low:
         return False
@@ -92,6 +110,112 @@ def guest_addresses(text: str, limit: int = 10) -> list[str]:
 
 def cancels_new_event(text: str) -> bool:
     return re.search(r"\b(never mind|nevermind|cancel that|forget it|don't create|do not create)\b", text.lower()) is not None
+
+
+def wants_move_event(text: str) -> bool:
+    """True when the user asks to move or reschedule an existing event."""
+    low = text.lower()
+    if re.search(r"\b(never mind|nevermind|cancel that|forget it)\b", low):
+        return False
+    if wants_new_event(low) and not re.search(r"\b(move|reschedule|postpone)\b", low):
+        return False
+    if re.search(r"\b(move|reschedule|postpone|push)\b", low) and re.search(
+        r"\b(event|meeting|appointment|session|invite|it|that|this)\b",
+        low,
+    ):
+        return True
+    if re.search(r"\b(change|update)\b.{0,30}\b(time|day|date)\b", low) and re.search(
+        r"\b(event|meeting|appointment|session|invite|it|that|this)\b",
+        low,
+    ):
+        return True
+    return False
+
+
+def match_calendar_event(events: list[dict], text: str) -> dict | None:
+    """Pick the calendar event the user named, by title words."""
+    low = text.lower()
+    best: dict | None = None
+    best_score = 0.0
+    for event in events:
+        if event.get("allDay"):
+            continue
+        title = str(event.get("title") or "").lower()
+        words = [word for word in re.findall(r"[a-z0-9]+", title) if len(word) > 2 and word not in _GENERIC_TITLE]
+        if not words:
+            continue
+        hits = sum(1 for word in words if word in low)
+        score = hits / len(words)
+        if hits and score > best_score:
+            best = event
+            best_score = score
+    if best is not None and best_score >= 0.34:
+        return best
+    timed = [event for event in events if not event.get("allDay")]
+    if len(timed) == 1 and re.search(r"\b(it|that|this)\b.{0,20}\b(event|meeting|appointment|session)?\b", low):
+        return timed[0]
+    return None
+
+
+def parse_move_event(text: str, now: datetime, events: list[dict]) -> tuple[dict | None, list[str]]:
+    """Read which event to move, the new day, and optional new time. Keeps length if omitted."""
+    zone = ZoneInfo(TIMEZONE)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=zone)
+    else:
+        now = now.astimezone(zone)
+    missing: list[str] = []
+    target = match_calendar_event(events, text)
+    if target is None:
+        missing.append("which event")
+    day, day_phrase = _find_day(text, now)
+    clock, time_phrase, ambiguous_time, ranged = _find_time(text)
+    minutes, _length_phrase, bad_length = _find_minutes(text)
+    if minutes is None and ranged is not None and 5 <= ranged <= 480:
+        minutes = ranged
+        bad_length = False
+    if day is None:
+        missing.append("day")
+    if target is None or day is None:
+        if ambiguous_time and clock is None:
+            missing.append("morning or afternoon")
+        return None, missing
+
+    old_start = datetime.fromisoformat(str(target["start"]))
+    if old_start.tzinfo is None:
+        old_start = old_start.replace(tzinfo=zone)
+    else:
+        old_start = old_start.astimezone(zone)
+    old_end = datetime.fromisoformat(str(target["end"]))
+    if old_end.tzinfo is None:
+        old_end = old_end.replace(tzinfo=zone)
+    else:
+        old_end = old_end.astimezone(zone)
+    old_minutes = max(5, int((old_end - old_start).total_seconds() // 60))
+    if minutes is None:
+        minutes = old_minutes
+    elif bad_length:
+        return None, ["a length from 5 minutes to 8 hours"]
+    if clock is None:
+        hour, minute = old_start.hour, old_start.minute
+    else:
+        hour, minute = clock
+    start = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if start <= now:
+        if re.search(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", day_phrase, re.I):
+            start = start + timedelta(days=7)
+        else:
+            return None, ["a later time"]
+    end = start + timedelta(minutes=minutes)
+    clock_label = start.strftime("%I:%M %p").lstrip("0")
+    return {
+        "id": target["id"],
+        "title": target["title"],
+        "start": start,
+        "end": end,
+        "minutes": minutes,
+        "when": f"{start.strftime('%A %d %B')} at {clock_label}",
+    }, []
 
 
 def meeting_minutes(text: str) -> int:
@@ -270,6 +394,11 @@ def _find_day(text: str, now: datetime) -> tuple[datetime | None, str]:
         start = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         found.append((tomorrow.start(), start, tomorrow.group(0)))
     for name, index in _WEEKDAYS.items():
+        next_week = re.search(rf"\bnext\s+week(?:'s)?\s+{name}\b", low)
+        if next_week:
+            week_start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=now.weekday())
+            found.append((next_week.start(), week_start + timedelta(days=7 + index), next_week.group(0)))
+            continue
         match = re.search(rf"\b(next\s+)?{name}\b", low)
         if not match:
             continue

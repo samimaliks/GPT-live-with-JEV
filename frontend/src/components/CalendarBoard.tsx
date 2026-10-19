@@ -57,15 +57,68 @@ function hourLabel(hour: number): string {
   return `${value} ${suffix}`;
 }
 
-function label(event: CalEvent): string {
+function jevTag(event: CalEvent): { percent: number; short: string; full: string } | null {
   if (event.decision === "now") {
-    const score = Math.round((event.choice ?? event.score ?? 0) * 100);
-    return `Attend now ${score}%`;
+    const percent = Math.round((event.choice ?? event.score ?? 0) * 100);
+    return { percent, short: "Now", full: `Attend now ${percent}%` };
   }
   if (event.decision === "later") {
-    return `Attend later ${Math.round((event.score ?? 0) * 100)}%`;
+    const percent = Math.round((event.score ?? 0) * 100);
+    return { percent, short: "Later", full: `Attend later ${percent}%` };
   }
-  return "";
+  return null;
+}
+
+function JevTag({ event }: { event: CalEvent }) {
+  const tag = jevTag(event);
+  if (!tag) return null;
+  return (
+    <span className="jev-tag" title={tag.full}>
+      <b>{tag.percent}%</b> {tag.short}
+    </span>
+  );
+}
+
+/** Split width only among events that overlap in time; non-overlapping events use full width. */
+function layoutDayEvents(dayEvents: CalEvent[]) {
+  const span = (HOUR_END - HOUR_START) * 60;
+  const items = dayEvents
+    .map((event) => {
+      const start = parseWhen(event.start);
+      const end = parseWhen(event.end);
+      const startMinutes = start.getHours() * 60 + start.getMinutes();
+      const endMinutes = Math.max(end.getHours() * 60 + end.getMinutes(), startMinutes + 30);
+      return { event, startMinutes, endMinutes };
+    })
+    .sort((a, b) => a.startMinutes - b.startMinutes || a.endMinutes - b.endMinutes);
+
+  const colEnds: number[] = [];
+  const placed = items.map((item) => {
+    let col = colEnds.findIndex((end) => end <= item.startMinutes);
+    if (col === -1) {
+      col = colEnds.length;
+      colEnds.push(item.endMinutes);
+    } else {
+      colEnds[col] = item.endMinutes;
+    }
+    return { ...item, col };
+  });
+
+  return placed.map((item) => {
+    const overlapping = placed.filter(
+      (other) => other.startMinutes < item.endMinutes && other.endMinutes > item.startMinutes,
+    );
+    const cols = Math.max(...overlapping.map((other) => other.col), item.col) + 1;
+    const top = Math.max(0, ((item.startMinutes - HOUR_START * 60) / span) * 100);
+    const height = Math.min(100 - top, ((item.endMinutes - item.startMinutes) / span) * 100);
+    return {
+      event: item.event,
+      top,
+      height,
+      left: (item.col / cols) * 100,
+      width: 100 / cols,
+    };
+  });
 }
 
 export function CalendarBoard({
@@ -126,7 +179,7 @@ export function CalendarBoard({
                 .map((event) => (
                   <article key={event.id} className={event.decision === "now" ? "block now" : "block later"}>
                     <strong>{event.title}</strong>
-                    <em>{label(event)}</em>
+                    <JevTag event={event} />
                   </article>
                 ))}
             </div>
@@ -149,52 +202,51 @@ export function CalendarBoard({
                 {HOURS.map((hour) => (
                   <div key={hour} className="slot" />
                 ))}
-                {events
-                  .filter((event) => !event.allDay && sameDay(parseWhen(event.start), day))
-                  .map((event, index, dayEvents) => {
-                    const start = parseWhen(event.start);
-                    const end = parseWhen(event.end);
-                    const startMinutes = start.getHours() * 60 + start.getMinutes();
-                    const endMinutes = Math.max(end.getHours() * 60 + end.getMinutes(), startMinutes + 30);
-                    const span = (HOUR_END - HOUR_START) * 60;
-                    const top = Math.max(0, ((startMinutes - HOUR_START * 60) / span) * 100);
-                    const height = Math.min(100 - top, ((endMinutes - startMinutes) / span) * 100);
-                    const width = 100 / dayEvents.length;
-                    return (
-                      <article
-                        key={event.id}
-                        className={event.decision === "now" ? "event now" : "event later"}
-                        style={{
-                          top: `${top}%`,
-                          height: `${Math.max(height, 8)}%`,
-                          left: `${index * width}%`,
-                          width: `${width}%`,
-                        }}
-                        title={event.guests.join(", ")}
-                      >
-                        <strong>{event.title}</strong>
-                        <em>{label(event)}</em>
-                      </article>
-                    );
-                  })}
+                {layoutDayEvents(
+                  events.filter((event) => !event.allDay && sameDay(parseWhen(event.start), day)),
+                ).map(({ event, top, height, left, width }) => (
+                  <article
+                    key={event.id}
+                    className={event.decision === "now" ? "event now" : "event later"}
+                    style={{
+                      top: `${top}%`,
+                      height: `${Math.max(height, 10)}%`,
+                      left: `${left}%`,
+                      width: `calc(${width}% - 4px)`,
+                      marginLeft: "2px",
+                    }}
+                    title={event.guests.join(", ")}
+                  >
+                    <strong>{event.title}</strong>
+                    <JevTag event={event} />
+                  </article>
+                ))}
               </div>
             </div>
           ))}
         </div>
-        {events.filter((event) => !days.some((day) => sameDay(parseWhen(event.start), day))).length ? (
-          <div className="outside">
-            {events
-              .filter((event) => !days.some((day) => sameDay(parseWhen(event.start), day)))
-              .map((event) => (
+        {(() => {
+          const weekEnd = addDays(days[0], 14);
+          const outside = events.filter((event) => {
+            const start = parseWhen(event.start);
+            if (Number.isNaN(start.getTime())) return false;
+            if (days.some((day) => sameDay(start, day))) return false;
+            // Keep near-term overflow only; skip far-future birthdays years out.
+            return start < weekEnd;
+          });
+          if (!outside.length) return null;
+          return (
+            <div className="outside">
+              {outside.map((event) => (
                 <article key={event.id} className={event.decision === "now" ? "block now" : "block later"}>
                   <strong>{event.title}</strong>
-                  <em>
-                    {label(event)} {event.start}
-                  </em>
+                  <JevTag event={event} />
+                  <em style={{ fontSize: 10, opacity: 0.9 }}>{event.start}</em>
                 </article>
               ))}
-          </div>
-        ) : null}
+            </div>
+          );
+        })()}
       </div>
     </section>
   );

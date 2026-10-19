@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from fastapi import WebSocket
 from openai import AsyncOpenAI
 
-from backend.app.calendar_api import create_event, list_events
+from backend.app.calendar_api import create_event, list_events, move_event
 from backend.app.config import TIMEZONE
 from backend.app.jev_rank import rank_events
 from backend.app.prompt import AGENT_BRIEF, AGENT_PROMPT
@@ -23,9 +23,11 @@ from backend.app.meetings import (
     EMAIL_RE,
     cancels_new_event,
     guest_addresses,
+    parse_move_event,
     parse_new_event,
     wants_existing_invites,
     wants_guests,
+    wants_move_event,
     wants_new_event,
 )
 from backend.app.weather import WeatherError, current_weather, wants_weather, weather_places
@@ -91,6 +93,11 @@ async def run_call(ws: WebSocket, owner_email: str) -> None:
     event_saving = False
     event_saved: set[str] = set()
     event_missing = ""
+    move_open = False
+    move_wait = False
+    move_saving = False
+    move_done: set[str] = set()
+    move_missing = ""
     guests_wanted = False
     guest_box = False
     pending_guests: list[str] = []
@@ -232,24 +239,7 @@ async def run_call(ws: WebSocket, owner_email: str) -> None:
                             "text": f"{details['title']} is on your calendar for {when}.{guest_note}",
                         }
                     )
-                    try:
-                        found = await asyncio.to_thread(list_events, owner_email)
-                    except Exception:
-                        found, problem = [], "The event was added, but the calendar could not be refreshed."
-                    else:
-                        try:
-                            ranked, problem = await rank_events(found) if found else ([], None)
-                        except Exception as exc:
-                            ranked, problem = found, str(exc)
-                        found = ranked
-                    await emit(
-                        {
-                            "type": "calendar",
-                            "phase": "ready" if found else "empty",
-                            "events": found,
-                            "error": problem or "",
-                        }
-                    )
+                    await refresh_calendar_panel()
                     if guests:
                         spoken = (
                             f"The event is on their calendar: {details['title']}, {when}, "
@@ -300,37 +290,15 @@ async def run_call(ws: WebSocket, owner_email: str) -> None:
                         if pending_details is not None:
                             await save_event(pending_details, found)
 
-                async def speak_calendar() -> None:
-                    await emit({"type": "calendar", "phase": "calling", "events": []})
-                    await connection.session.commentary.append(
-                        content=(
-                            "The caller asked for their calendar. Say you are checking it now. "
-                            "Wait for Jev's decision before you name any event."
-                        ),
-                        delegation_id=None,
-                        event_id="event_calendar_checking",
-                    )
+                async def refresh_calendar_panel() -> tuple[list[dict[str, Any]], str]:
                     try:
                         found = await asyncio.to_thread(list_events, owner_email)
                     except Exception as exc:
                         await emit({"type": "calendar", "phase": "error", "events": [], "error": str(exc)})
-                        await connection.session.commentary.append(
-                            content=(
-                                "Their calendar could not be read. Say that. "
-                                "Do not invent events."
-                            ),
-                            delegation_id=None,
-                            event_id="event_calendar_failed",
-                        )
-                        return
+                        return [], str(exc)
                     if not found:
                         await emit({"type": "calendar", "phase": "empty", "events": []})
-                        await connection.session.commentary.append(
-                            content="Their calendar has no upcoming events. Say that. Do not invent events.",
-                            delegation_id=None,
-                            event_id="event_calendar_empty",
-                        )
-                        return
+                        return [], ""
                     try:
                         ranked, problem = await rank_events(found)
                     except Exception as exc:
@@ -343,7 +311,90 @@ async def run_call(ws: WebSocket, owner_email: str) -> None:
                             "error": problem or "",
                         }
                     )
-                    # Speak the Google events even when Jev/OpenRouter fails.
+                    print(
+                        f"Calendar ready for {owner_email}: {len(ranked)} event(s)"
+                        + (f" ({problem})" if problem else "")
+                    )
+                    return ranked, problem or ""
+
+                async def save_move(details: dict[str, Any]) -> None:
+                    nonlocal move_open, move_saving, move_missing
+                    slot = f"{details['id']}|{details['start'].isoformat()}"
+                    if slot in move_done or move_saving:
+                        return
+                    move_saving = True
+                    move_open = True
+                    await emit({"type": "status", "text": f"Moving {details['title']} on your calendar..."})
+                    try:
+                        _link, when = await asyncio.to_thread(
+                            move_event,
+                            owner_email,
+                            str(details["id"]),
+                            details["start"],
+                            details["end"],
+                        )
+                    except Exception as exc:
+                        move_saving = False
+                        await emit({"type": "error", "text": f"The event could not be moved: {exc}"})
+                        await connection.session.commentary.append(
+                            content=(
+                                "The event could not be moved. Say that. "
+                                "Do not say that it was moved."
+                            ),
+                            delegation_id=None,
+                            event_id="event_move_failed",
+                        )
+                        return
+                    move_done.add(slot)
+                    move_saving = False
+                    move_open = False
+                    move_missing = ""
+                    await emit(
+                        {
+                            "type": "event_created",
+                            "text": f"{details['title']} was moved to {when}.",
+                        }
+                    )
+                    await refresh_calendar_panel()
+                    await connection.session.commentary.append(
+                        content=(
+                            f"The event was moved on their calendar: {details['title']}, {when}, "
+                            f"{details['minutes']} minutes, Asia/Karachi. "
+                            "Confirm the title and the new time in one short sentence. "
+                            "Do not say goodbye."
+                        ),
+                        delegation_id=None,
+                        event_id="event_moved",
+                    )
+
+                async def speak_calendar() -> None:
+                    await emit({"type": "calendar", "phase": "calling", "events": []})
+                    await connection.session.commentary.append(
+                        content=(
+                            "The caller asked for their calendar. Say you are checking it now. "
+                            "Wait for Jev's decision before you name any event."
+                        ),
+                        delegation_id=None,
+                        event_id="event_calendar_checking",
+                    )
+                    ranked, problem = await refresh_calendar_panel()
+                    if problem and not ranked:
+                        await connection.session.commentary.append(
+                            content=(
+                                "Their calendar could not be read. Say that. "
+                                "Do not invent events."
+                            ),
+                            delegation_id=None,
+                            event_id="event_calendar_failed",
+                        )
+                        return
+                    if not ranked:
+                        await connection.session.commentary.append(
+                            content="Their calendar has no upcoming events. Say that. Do not invent events.",
+                            delegation_id=None,
+                            event_id="event_calendar_empty",
+                        )
+                        return
                     note = _decision_text(ranked)
                     if problem:
                         note = (
@@ -462,20 +513,79 @@ async def run_call(ws: WebSocket, owner_email: str) -> None:
 
                                 weather_wait = True
                                 asyncio.create_task(maybe_weather())
-                            if event_open and cancels_new_event(user_said[-160:]):
+                            if (event_open or move_open) and cancels_new_event(user_said[-160:]):
+                                was_move = move_open and not event_open
                                 event_open = False
                                 event_missing = ""
+                                move_open = False
+                                move_missing = ""
                                 guests_wanted = False
                                 guest_box = False
                                 pending_details = None
                                 pending_guests = []
                                 await emit({"type": "need_email", "open": False})
                                 await connection.session.commentary.append(
-                                    content="They cancelled the new event. Do not create it. Do not ask for an email.",
+                                    content=(
+                                        "They cancelled moving the event. Do not move it."
+                                        if was_move
+                                        else "They cancelled the new event. Do not create it. Do not ask for an email."
+                                    ),
                                     delegation_id=None,
-                                    event_id="event_create_cancelled",
+                                    event_id="event_move_cancelled" if was_move else "event_create_cancelled",
                                 )
-                            elif wants_new_event(heard) and not event_wait and not event_saving:
+                            elif wants_move_event(heard) and not move_wait and not move_saving and not event_saving:
+
+                                async def maybe_move() -> None:
+                                    nonlocal move_open, move_wait, move_missing
+                                    await asyncio.sleep(1.6)
+                                    move_wait = False
+                                    latest = user_said[-1500:]
+                                    if cancels_new_event(latest[-160:]) or not wants_move_event(latest):
+                                        if not move_saving:
+                                            move_open = False
+                                        return
+                                    try:
+                                        found = await asyncio.to_thread(list_events, owner_email)
+                                    except Exception as exc:
+                                        await emit({"type": "error", "text": f"The calendar could not be read: {exc}"})
+                                        await connection.session.commentary.append(
+                                            content=(
+                                                "Their calendar could not be read, so the event was not moved. "
+                                                "Say that. Do not invent a new time."
+                                            ),
+                                            delegation_id=None,
+                                            event_id="event_move_list_failed",
+                                        )
+                                        return
+                                    details, missing = parse_move_event(
+                                        latest,
+                                        datetime.now(ZoneInfo(TIMEZONE)),
+                                        found,
+                                    )
+                                    if details is None:
+                                        move_open = True
+                                        key = ", ".join(missing)
+                                        if key == move_missing:
+                                            return
+                                        move_missing = key
+                                        await connection.session.commentary.append(
+                                            content=(
+                                                "The user wants to move an existing calendar event. "
+                                                f"These details are still missing: {key}. "
+                                                "Ask only for those details. "
+                                                "Do not say the event was moved yet."
+                                            ),
+                                            delegation_id=None,
+                                            event_id="event_move_need_details",
+                                        )
+                                        return
+                                    move_missing = ""
+                                    await save_move(details)
+
+                                move_wait = True
+                                move_open = True
+                                asyncio.create_task(maybe_move())
+                            elif wants_new_event(heard) and not event_wait and not event_saving and not move_open:
 
                                 async def maybe_create() -> None:
                                     nonlocal event_open, event_wait, event_missing, guests_wanted, guest_box, pending_details
@@ -532,6 +642,7 @@ async def run_call(ws: WebSocket, owner_email: str) -> None:
                             if (
                                 not end_scheduled
                                 and not event_open
+                                and not move_open
                                 and re.search(r"\b(bye|goodbye)\b", user_said[-60:].lower())
                             ):
                                 end_scheduled = True
