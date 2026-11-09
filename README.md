@@ -16,6 +16,9 @@ Weather uses Open-Meteo and does not need a key.
 
 Use headphones. The microphone will hear the assistant through the speakers. Voice time bills at $0.05 per minute.
 
+**Detailed instructions:** [Setup guide](https://docs.google.com/document/d/1t-2q9RuiZwg_9cx0P--rdr-YLwraKR4BeMePAmkl6fE/edit?tab=t.bja0r44sjema)
+
+
 ## Setup
 
 From the repo root (Windows, macOS, or Linux):
